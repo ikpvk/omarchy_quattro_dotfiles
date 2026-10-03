@@ -1,0 +1,176 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Toggle the Omarchy internal laptop display while keeping the internal panel
+# backlight in sync with the eDP-1 enabled/disabled state.
+#
+# - Before disabling the internal display, save the current backlight value.
+# - After disabling is confirmed, set the internal panel backlight to 0.
+# - When enabling the internal display, restore the saved backlight value.
+
+ACTION="${1:-toggle}"
+BACKLIGHT_DEVICE="${BACKLIGHT_DEVICE:-intel_backlight}"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/internal-display-backlight"
+BRIGHTNESS_FILE="$STATE_DIR/${BACKLIGHT_DEVICE}.brightness"
+DISABLE_TOGGLE_FLAG="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/toggles/hypr/internal-monitor-disable.lua"
+BACKLIGHT_OFF_FLAG="$STATE_DIR/${BACKLIGHT_DEVICE}.off"
+
+mkdir -p "$STATE_DIR"
+
+# Keep one watcher per compositor session. Serialize toggle and fallback actions
+# so a disconnect cannot race brightness saving or a manual toggle.
+if [[ "$ACTION" == watch ]]; then
+  SOCKET="${XDG_RUNTIME_DIR:?}/hypr/${HYPRLAND_INSTANCE_SIGNATURE:?}/.socket2.sock"
+  exec 8>"$XDG_RUNTIME_DIR/internal-display-backlight-${HYPRLAND_INSTANCE_SIGNATURE}.lock"
+  flock -n 8 || exit 0
+  while [[ -S "$SOCKET" ]]; do
+    "$0" fallback || true
+    sleep 1
+  done
+  exit 0
+fi
+exec 9>"${XDG_RUNTIME_DIR:?}/internal-display-backlight-action.lock"
+flock 9
+
+internal_output() {
+  omarchy-hyprland-monitor-laptop
+}
+
+current_brightness() {
+  brightnessctl --device="$BACKLIGHT_DEVICE" get
+}
+
+max_brightness() {
+  brightnessctl --device="$BACKLIGHT_DEVICE" max
+}
+
+save_brightness() {
+  local current
+  current="$(current_brightness)"
+  # Repeated off requests must not overwrite the saved brightness with zero.
+  if (( current > 0 )); then
+    printf '%s\n' "$current" >"$BRIGHTNESS_FILE"
+  fi
+}
+
+restore_brightness() {
+  local saved max
+  max="$(max_brightness)"
+  saved=$(( max / 3 ))
+  if [[ -s "$BRIGHTNESS_FILE" ]]; then
+    saved="$(<"$BRIGHTNESS_FILE")"
+  fi
+  if [[ ! "$saved" =~ ^[0-9]+$ ]] || (( saved == 0 )); then
+    saved=$(( max / 3 ))
+  fi
+  (( saved > 0 )) || saved=1
+  (( saved <= max )) || saved="$max"
+
+  brightnessctl --device="$BACKLIGHT_DEVICE" set "$saved" >/dev/null
+  rm -f "$BACKLIGHT_OFF_FLAG"
+}
+
+backlight_off() {
+  touch "$BACKLIGHT_OFF_FLAG"
+  brightnessctl --device="$BACKLIGHT_DEVICE" set 0% >/dev/null
+}
+
+internal_is_disabled() {
+  local output
+  output="$(internal_output)"
+  [[ -n "$output" ]] || return 1
+
+  export OUTPUT="$output"
+  hyprctl monitors -j all | python -c '
+import json, os, sys
+wanted = os.environ["OUTPUT"]
+try:
+    monitors = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+for monitor in monitors:
+    if monitor.get("name") == wanted:
+        sys.exit(0 if monitor.get("disabled") else 1)
+sys.exit(1)
+'
+}
+
+after_off() {
+  # Only force the backlight off if Hyprland actually reports the internal
+  # display as disabled. This avoids blacking out the panel when disabling was
+  # refused, e.g. because no external monitor is active.
+  if internal_is_disabled; then
+    backlight_off
+  fi
+}
+
+after_on() {
+  # Restore only when the internal display is no longer disabled.
+  if ! internal_is_disabled; then
+    restore_brightness
+  fi
+}
+
+fallback() {
+  # No-op during ordinary laptop use, brightness changes, and idle blanking.
+  [[ -f "$DISABLE_TOGGLE_FLAG" || -f "$BACKLIGHT_OFF_FLAG" ]] || return 0
+  local monitors restore_needed=0
+  [[ ! -f "$DISABLE_TOGGLE_FLAG" ]] || restore_needed=1
+  [[ ! -f "$BACKLIGHT_OFF_FLAG" ]] || restore_needed=1
+  monitors="$(hyprctl monitors all -j)" || return 1
+  # A failed/malformed query must never be treated as a monitor disconnection.
+  printf '%s' "$monitors" | jq -e '
+    type == "array" and length > 0 and
+    any(.[]; .name | test("^(eDP|LVDS|DSI)-")) and
+    (any(.[]; (.name | test("^(eDP|LVDS|DSI)-") | not)
+      and .name != "FALLBACK"
+      and .disabled == false) | not)
+  ' >/dev/null || return 0
+  # The stock recover action counts Hyprland's FALLBACK output as external.
+  # Our check above already confirmed no real external output remains.
+  omarchy-hyprland-monitor-internal on
+  monitors="$(hyprctl monitors all -j)" || return 1
+  printf '%s' "$monitors" | jq -e '
+    any(.[]; (.name | test("^(eDP|LVDS|DSI)-")) and .disabled == false)
+  ' >/dev/null || return 1
+  if (( restore_needed )); then
+    restore_brightness
+  fi
+}
+
+case "$ACTION" in
+  off)
+    save_brightness
+    omarchy-hyprland-monitor-internal off
+    after_off
+    ;;
+  on)
+    omarchy-hyprland-monitor-internal on
+    after_on
+    ;;
+  toggle)
+    if [[ -f "$DISABLE_TOGGLE_FLAG" ]]; then
+      omarchy-hyprland-monitor-internal on
+      after_on
+    else
+      save_brightness
+      omarchy-hyprland-monitor-internal off
+      after_off
+    fi
+    ;;
+  recover)
+    omarchy-hyprland-monitor-internal recover
+    if [[ -f "$DISABLE_TOGGLE_FLAG" ]]; then
+      after_off
+    else
+      after_on
+    fi
+    ;;
+  fallback)
+    fallback
+    ;;
+  *)
+    echo "Usage: $(basename "$0") {on|off|toggle|recover|fallback|watch}" >&2
+    exit 1
+    ;;
+esac
